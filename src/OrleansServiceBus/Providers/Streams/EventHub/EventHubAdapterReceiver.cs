@@ -8,9 +8,8 @@ using Microsoft.ServiceBus.Messaging;
 using Orleans.Providers.Streams.Common;
 using Orleans.Runtime;
 using Orleans.Streams;
-using OrleansServiceBusUtils.Providers.Streams.EventHub;
 
-namespace Orleans.ServiceBus.Providers.Streams.EventHub
+namespace Orleans.ServiceBus.Providers
 {
     internal class EventHubPartitionConfig
     {
@@ -18,26 +17,161 @@ namespace Orleans.ServiceBus.Providers.Streams.EventHub
         public string Partition { get; set; }
     }
 
+
     internal class EventHubAdapterReceiver : IQueueAdapterReceiver, IQueueCache
     {
+        public const int MaxMessagesPerRead = 1000;
         private static readonly TimeSpan ReceiveTimeout = TimeSpan.FromSeconds(5);
 
-        private readonly ICacheDataAdapter<EventData, CachedEventHubMessage> dataAdapter;
         private readonly EventHubPartitionConfig config;
+        private readonly Func<IStreamQueueCheckpointer<string>, IEventHubQueueCache> cacheFactory;
+        private readonly Func<string, Task<IStreamQueueCheckpointer<string>>> checkpointerFactory;
 
-        private PooledQueueCache<EventData, CachedEventHubMessage> cache;
+        private IEventHubQueueCache cache;
         private EventHubReceiver receiver;
+        private IStreamQueueCheckpointer<string> checkpointer;
+        private AggregatedQueueFlowController flowController;
+
+        public int GetMaxAddCount() { return flowController.GetMaxAddCount(); }
+
+        public EventHubAdapterReceiver(EventHubPartitionConfig partitionConfig,
+            Func<IStreamQueueCheckpointer<string>,IEventHubQueueCache> cacheFactory,
+            Func<string, Task<IStreamQueueCheckpointer<string>>> checkpointerFactory,
+            Logger log)
+        {
+            this.cacheFactory = cacheFactory;
+            this.checkpointerFactory = checkpointerFactory;
+            config = partitionConfig;
+        }
+
+        public async Task Initialize(TimeSpan timeout)
+        {
+            checkpointer = await checkpointerFactory(config.Partition);
+            cache = cacheFactory(checkpointer);
+            flowController = new AggregatedQueueFlowController(MaxMessagesPerRead) { cache };
+            string offset = await checkpointer.Load();
+            receiver = await CreateReceiver(config, offset);
+        }
+
+        public async Task<IList<IBatchContainer>> GetQueueMessagesAsync(int maxCount)
+        {
+            if (receiver == null || maxCount <= 0)
+            {
+                return new List<IBatchContainer>();
+            }
+            List<EventData> messages = (await receiver.ReceiveAsync(maxCount, ReceiveTimeout)).ToList();
+
+            var batches = new List<IBatchContainer>();
+            if (messages.Count == 0)
+            {
+                return batches;
+            }
+            foreach (EventData message in messages)
+            {
+                cache.Add(message);
+                batches.Add(new StreamActivityNotificationBatch(Guid.Parse(message.PartitionKey),
+                    message.GetStreamNamespaceProperty(), new EventSequenceToken(message.SequenceNumber, 0)));
+
+            }
+
+            if (!checkpointer.CheckpointExists)
+            {
+                checkpointer.Update(messages[0].Offset, DateTime.UtcNow);
+            }
+            return batches;
+        }
+
+        public void AddToCache(IList<IBatchContainer> messages)
+        {
+            // do nothing, we add data directly into cache.  No need for agent involvement
+        }
+
+        public bool TryPurgeFromCache(out IList<IBatchContainer> purgedItems)
+        {
+            purgedItems = null;
+            return false;
+        }
+
+        public IQueueCacheCursor GetCacheCursor(IStreamIdentity streamIdentity, StreamSequenceToken token)
+        {
+            return new Cursor(cache, streamIdentity, token);
+        }
+
+        public bool IsUnderPressure()
+        {
+            return false;
+        }
+
+        public Task MessagesDeliveredAsync(IList<IBatchContainer> messages)
+        {
+            return TaskDone.Done;
+        }
+
+        public Task Shutdown(TimeSpan timeout)
+        {
+            // clear cache and receiver
+            IEventHubQueueCache localCache = Interlocked.Exchange(ref cache, null);
+            EventHubReceiver localReceiver = Interlocked.Exchange(ref receiver, null);
+            // start closing receiver
+            Task closeTask = TaskDone.Done;
+            if (localReceiver != null)
+            {
+                closeTask = localReceiver.CloseAsync();
+            }
+            // dispose of cache
+            if (localCache != null)
+            {
+                localCache.Dispose();
+            }
+            // finish return receiver closing task
+            return closeTask;
+        }
+
+        private static Task<EventHubReceiver> CreateReceiver(EventHubPartitionConfig partitionConfig, string offset)
+        {
+            EventHubClient client = EventHubClient.CreateFromConnectionString(partitionConfig.Hub.ConnectionString, partitionConfig.Hub.Path);
+            EventHubConsumerGroup consumerGroup = client.GetConsumerGroup(partitionConfig.Hub.ConsumerGroup);
+            if (partitionConfig.Hub.PrefetchCount.HasValue)
+            {
+                consumerGroup.PrefetchCount = partitionConfig.Hub.PrefetchCount.Value;
+            }
+            // if we have a starting offset or if we're not configured to start reading from utc now, read from offset
+            if (!partitionConfig.Hub.StartFromNow || offset != EventHubConsumerGroup.StartOfStream)
+            {
+                return consumerGroup.CreateReceiverAsync(partitionConfig.Partition, offset, true);
+            }
+            return consumerGroup.CreateReceiverAsync(partitionConfig.Partition, DateTime.UtcNow);
+        }
+
+        private class StreamActivityNotificationBatch : IBatchContainer
+        {
+            public Guid StreamGuid { get; private set; }
+            public string StreamNamespace { get; private set; }
+            public StreamSequenceToken SequenceToken { get; private set; }
+
+            public StreamActivityNotificationBatch(Guid streamGuid, string streamNamespace,
+                StreamSequenceToken sequenceToken)
+            {
+                StreamGuid = streamGuid;
+                StreamNamespace = streamNamespace;
+                SequenceToken = sequenceToken;
+            }
+
+            public IEnumerable<Tuple<T, StreamSequenceToken>> GetEvents<T>() { throw new NotSupportedException(); }
+            public bool ImportRequestContext() { throw new NotSupportedException(); }
+            public bool ShouldDeliver(IStreamIdentity stream, object filterData, StreamFilterPredicate shouldReceiveFunc) { throw new NotSupportedException(); }
+        }
 
         private class Cursor : IQueueCacheCursor
         {
-            private readonly PooledQueueCache<EventData, CachedEventHubMessage> cache;
+            private readonly IEventHubQueueCache cache;
             private readonly object cursor;
             private IBatchContainer current;
 
-            public Cursor(PooledQueueCache<EventData, CachedEventHubMessage> cache, Guid streamGuid, string streamNamespace, StreamSequenceToken token)
+            public Cursor(IEventHubQueueCache cache, IStreamIdentity streamIdentity, StreamSequenceToken token)
             {
                 this.cache = cache;
-                cursor = cache.GetCursor(streamGuid, streamNamespace, token);
+                cursor = cache.GetCursor(streamIdentity, token);
             }
 
             public void Dispose()
@@ -65,113 +199,10 @@ namespace Orleans.ServiceBus.Providers.Streams.EventHub
             public void Refresh()
             {
             }
-        }
 
-        public int MaxAddCount { get { return 1000; } }
-
-        public EventHubAdapterReceiver(EventHubPartitionConfig partitionConfig, IObjectPool<FixedSizeBuffer> bufferPool, Logger log)
-        {
-            dataAdapter = new EventHubDataAdapter(bufferPool, Purge);
-            config = partitionConfig;
-        }
-
-        public void AddToCache(IList<IBatchContainer> messages)
-        {
-            // do nothing, we add data directly into cache.  No need for agent involvment
-        }
-
-        public bool TryPurgeFromCache(out IList<IBatchContainer> purgedItems)
-        {
-            purgedItems = null;
-            return false;
-        }
-
-        public IQueueCacheCursor GetCacheCursor(Guid streamGuid, string streamNamespace, StreamSequenceToken token)
-        {
-            return new Cursor(cache, streamGuid, streamNamespace, token);
-        }
-
-        public bool IsUnderPressure()
-        {
-            return false;
-        }
-
-        private static Task<EventHubReceiver> CreateReceiver(EventHubPartitionConfig partitionConfig)
-        {
-            EventHubClient client = EventHubClient.CreateFromConnectionString(partitionConfig.Hub.ConnectionString, partitionConfig.Hub.Path);
-            EventHubConsumerGroup consumerGroup = client.GetConsumerGroup(partitionConfig.Hub.ConsumerGroup);
-            if (partitionConfig.Hub.PrefetchCount.HasValue)
+            public void RecordDeliveryFailure()
             {
-                consumerGroup.PrefetchCount = partitionConfig.Hub.PrefetchCount.Value;
             }
-            return consumerGroup.CreateReceiverAsync(partitionConfig.Partition, DateTime.UtcNow);
-        }
-
-        public async Task Initialize(TimeSpan timeout)
-        {
-            cache = new PooledQueueCache<EventData, CachedEventHubMessage>(dataAdapter);
-            receiver = await CreateReceiver(config);
-        }
-
-        public async Task<IList<IBatchContainer>> GetQueueMessagesAsync(int maxCount)
-        {
-            IEnumerable<EventData> messages = await receiver.ReceiveAsync(maxCount, ReceiveTimeout);
-            return BuildBatchList(messages);
-        }
-
-        public Task MessagesDeliveredAsync(IList<IBatchContainer> messages)
-        {
-            return TaskDone.Done;
-        }
-
-        public async Task Shutdown(TimeSpan timeout)
-        {
-            EventHubReceiver localReceiver = Interlocked.Exchange(ref receiver, null);
-            if (localReceiver != null)
-            {
-                await localReceiver.CloseAsync();
-            }
-        }
-
-        private IList<IBatchContainer> BuildBatchList(IEnumerable<EventData> messages)
-        {
-            var batches = new List<IBatchContainer>();
-            foreach (EventData message in messages)
-            {
-                cache.Add(message);
-                batches.Add(new StreamActivityNotificationBatch(Guid.Parse(message.PartitionKey),
-                    message.GetStreamNamespaceProperty(), new EventSequenceToken(message.SequenceNumber, 0)));
-                
-            }
-            return batches;
-        }
-
-        private void Purge(IDisposable purgedResource)
-        {
-            cache.Purge(purgedResource);
-        }
-
-        /// <summary>
-        /// This batch is primarily used to notify the adapter of stream activity.  It is never delivered
-        ///   to consumers, so does not need to be serializable.
-        /// </summary>
-        private class StreamActivityNotificationBatch : IBatchContainer
-        {
-            public Guid StreamGuid { get; private set; }
-            public string StreamNamespace { get; private set; }
-            public StreamSequenceToken SequenceToken { get; private set; }
-
-            public StreamActivityNotificationBatch(Guid streamGuid, string streamNamespace,
-                StreamSequenceToken sequenceToken)
-            {
-                StreamGuid = streamGuid;
-                StreamNamespace = streamNamespace;
-                SequenceToken = sequenceToken;
-            }
-
-            public IEnumerable<Tuple<T, StreamSequenceToken>> GetEvents<T>() { throw new NotSupportedException(); }
-            public bool ImportRequestContext() { throw new NotSupportedException(); }
-            public bool ShouldDeliver(IStreamIdentity stream, object filterData, StreamFilterPredicate shouldReceiveFunc) { throw new NotSupportedException(); }
         }
     }
 }

@@ -13,9 +13,8 @@ namespace Orleans.CodeGenerator
     using Orleans.Async;
     using Orleans.CodeGeneration;
     using Orleans.Runtime;
-    using Orleans.Serialization;
 
-    using GrainInterfaceData = Orleans.CodeGeneration.GrainInterfaceData;
+    using GrainInterfaceUtils = Orleans.CodeGeneration.GrainInterfaceUtils;
     using SF = Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
     /// <summary>
@@ -284,11 +283,7 @@ namespace Orleans.CodeGenerator
             if (runtime)
             {
                 // Ignore types which have already been accounted for.
-                ignoredTypes = CodeGeneratorCommon.GetTypesWithImplementations(
-                    typeof(MethodInvokerAttribute),
-                    typeof(GrainReferenceAttribute),
-                    typeof(GrainStateAttribute),
-                    typeof(SerializerAttribute));
+                ignoredTypes = GetTypesWithGeneratedSupportClasses();
                 targetAssembly = null;
             }
             else
@@ -307,7 +302,7 @@ namespace Orleans.CodeGenerator
                     .ToSet();
             if (knownAssemblies.Count > 0)
             {
-                knownAssemblies.IntersectWith(assemblies);
+                knownAssemblies.UnionWith(assemblies);
                 assemblies = knownAssemblies.ToList();
             }
 
@@ -350,7 +345,7 @@ namespace Orleans.CodeGenerator
                         Logger.Verbose2("Generating code for: {0}", type.GetParseableName());
                     }
 
-                    if (GrainInterfaceData.IsGrainInterface(type))
+                    if (GrainInterfaceUtils.IsGrainInterface(type))
                     {
                         if (Logger.IsVerbose2)
                         {
@@ -359,7 +354,7 @@ namespace Orleans.CodeGenerator
                                 type.GetParseableName());
                         }
 
-                        GrainInterfaceData.ValidateInterfaceRules(type);
+                        GrainInterfaceUtils.ValidateInterfaceRules(type);
 
                         namespaceMembers.Add(GrainReferenceGenerator.GenerateClass(type, onEncounteredType));
                         namespaceMembers.Add(GrainMethodInvokerGenerator.GenerateClass(type));
@@ -427,7 +422,7 @@ namespace Orleans.CodeGenerator
             ISet<Type> includedTypes)
         {
             // The module containing the serializer.
-            var module = runtime ? null : type.Module;
+            var module = runtime || type.Assembly != targetAssembly ? null : type.Module;
             var typeInfo = type.GetTypeInfo();
 
             // If a type was encountered which can be accessed and is marked as [Serializable], process it for serialization.
@@ -438,7 +433,7 @@ namespace Orleans.CodeGenerator
             ConsiderGenericInterfacesArguments(typeInfo, module, targetAssembly, includedTypes);
 
             // Collect the types which require code generation.
-            if (GrainInterfaceData.IsGrainInterface(type))
+            if (GrainInterfaceUtils.IsGrainInterface(type))
             {
                 if (Logger.IsVerbose2) Logger.Verbose2("Will generate code for: {0}", type.GetParseableName());
 
@@ -481,6 +476,36 @@ namespace Orleans.CodeGenerator
             {
                 RecordType(type, module, targetAssembly, includedTypes);
             }
+        }
+
+        /// <summary>
+        /// Get types which have corresponding generated classes.
+        /// </summary>
+        /// <returns>Types which have corresponding generated classes marked.</returns>
+        private static HashSet<Type> GetTypesWithGeneratedSupportClasses()
+        {
+            // Get assemblies which contain generated code.
+            var all =
+                AppDomain.CurrentDomain.GetAssemblies()
+                    .Where(_ => _.GetCustomAttribute<GeneratedCodeAttribute>() != null)
+                    .SelectMany(_ => _.DefinedTypes);
+
+            // Get all generated types in each assembly.
+            var attributes = all.SelectMany(_ => _.GetCustomAttributes<GeneratedAttribute>());
+            var results = new HashSet<Type>();
+            foreach (var attribute in attributes)
+            {
+                if (attribute.GrainType != null)
+                {
+                    results.Add(attribute.GrainType);
+                }
+                else if (!string.IsNullOrWhiteSpace(attribute.ForGrainType))
+                {
+                    results.Add(Type.GetType(attribute.ForGrainType));
+                }
+            }
+
+            return results;
         }
 
         /// <summary>

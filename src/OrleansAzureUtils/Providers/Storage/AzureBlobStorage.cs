@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Runtime.Serialization.Formatters;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.WindowsAzure.Storage;
@@ -11,6 +10,7 @@ using Orleans.Providers.Azure;
 using Orleans.Runtime;
 using System.Collections.Generic;
 using Orleans.Runtime.Configuration;
+using Orleans.Serialization;
 
 namespace Orleans.Storage
 {
@@ -44,7 +44,11 @@ namespace Orleans.Storage
     /// </example>
     public class AzureBlobStorage : IStorageProvider
     {
-        private JsonSerializerSettings settings;
+        internal const string DataConnectionStringPropertyName = AzureTableStorage.DataConnectionStringPropertyName;
+        internal const string ContainerNamePropertyName = "ContainerName";
+        internal const string ContainerNameDefaultValue = "grainstate";
+
+        private JsonSerializerSettings jsonSettings;
 
         private CloudBlobContainer container;
 
@@ -65,13 +69,13 @@ namespace Orleans.Storage
             try
             {
                 this.Name = name;
-                ConfigureJsonSerializerSettings(config);
+                this.jsonSettings = SerializationManager.UpdateSerializerSettings(SerializationManager.GetDefaultJsonSerializerSettings(), config);
 
-                if (!config.Properties.ContainsKey("DataConnectionString")) throw new BadProviderConfigException("The DataConnectionString setting has not been configured in the cloud role. Please add a DataConnectionString setting with a valid Azure Storage connection string.");
+                if (!config.Properties.ContainsKey(DataConnectionStringPropertyName)) throw new BadProviderConfigException($"The {DataConnectionStringPropertyName} setting has not been configured in the cloud role. Please add a {DataConnectionStringPropertyName} setting with a valid Azure Storage connection string.");
 
-                var account = CloudStorageAccount.Parse(config.Properties["DataConnectionString"]);
+                var account = CloudStorageAccount.Parse(config.Properties[DataConnectionStringPropertyName]);
                 var blobClient = account.CreateCloudBlobClient();
-                var containerName = config.Properties.ContainsKey("ContainerName") ? config.Properties["ContainerName"] : "grainstate";
+                var containerName = config.Properties.ContainsKey(ContainerNamePropertyName) ? config.Properties[ContainerNamePropertyName] : ContainerNameDefaultValue;
                 container = blobClient.GetContainerReference(containerName);
                 await container.CreateIfNotExistsAsync().ConfigureAwait(false);
 
@@ -87,68 +91,13 @@ namespace Orleans.Storage
 
         IEnumerable<string> FormatPropertyMessage(IProviderConfiguration config)
         {
-            foreach (var property in new string[] { "ContainerName", "SerializeTypeNames", "PreserveReferencesHandling", "UseFullAssemblyNames", "IndentJSON" })
+            foreach (var property in new string[] { ContainerNamePropertyName, "SerializeTypeNames", "PreserveReferencesHandling", "UseFullAssemblyNames", "IndentJSON" })
             {
                 if (!config.Properties.ContainsKey(property)) continue;
                 yield return string.Format("{0}={1}", property, config.Properties[property]);
             }
         }
 
-
-        private void ConfigureJsonSerializerSettings(IProviderConfiguration config)
-        {
-            // By default, use automatic type name handling, simple assembly names, and no JSON formatting
-            settings = new JsonSerializerSettings
-            {
-                TypeNameHandling = TypeNameHandling.Auto,
-                TypeNameAssemblyFormat = FormatterAssemblyStyle.Simple,
-                Formatting = Formatting.None
-            };
-
-            if (config.Properties.ContainsKey("SerializeTypeNames"))
-            {
-                bool serializeTypeNames = false;
-                var serializeTypeNamesValue = config.Properties["SerializeTypeNames"];
-                bool.TryParse(serializeTypeNamesValue, out serializeTypeNames);
-                if (serializeTypeNames)
-                {
-                    settings.TypeNameHandling = TypeNameHandling.All;
-                }
-            }
-
-            if (config.Properties.ContainsKey("PreserveReferencesHandling"))
-            {
-                bool preserveReferencesHandling;
-                var preserveReferencesHandlingValue = config.Properties["PreserveReferencesHandling"];
-                bool.TryParse(preserveReferencesHandlingValue, out preserveReferencesHandling);
-                if (preserveReferencesHandling)
-                {
-                    settings.PreserveReferencesHandling = PreserveReferencesHandling.Objects;
-                }
-            }
-
-            if (config.Properties.ContainsKey("UseFullAssemblyNames"))
-            {
-                bool useFullAssemblyNames = false;
-                var UseFullAssemblyNamesValue = config.Properties["UseFullAssemblyNames"];
-                bool.TryParse(UseFullAssemblyNamesValue, out useFullAssemblyNames);
-                if (useFullAssemblyNames)
-                {
-                    settings.TypeNameAssemblyFormat = FormatterAssemblyStyle.Full;
-                }
-            }
-
-            if (config.Properties.ContainsKey("IndentJSON"))
-            {
-                bool indentJSON = false;
-                var indentJSONValue = config.Properties["IndentJSON"];
-                bool.TryParse(indentJSONValue, out indentJSON);
-                if (indentJSON)
-                {
-                    settings.Formatting = Formatting.Indented;
-                }
-            }
-        }
 
         /// <summary> Shutdown this storage provider. </summary>
         /// <see cref="IProvider.Close"/>
@@ -197,7 +146,7 @@ namespace Orleans.Storage
                     return;
                 }
 
-                grainState.State = JsonConvert.DeserializeObject(json, grainState.State.GetType(), settings);
+                grainState.State = JsonConvert.DeserializeObject(json, grainState.State.GetType(), jsonSettings);
                 grainState.ETag = blob.Properties.ETag;
 
                 if (this.Log.IsVerbose3) this.Log.Verbose3((int)AzureProviderErrorCode.AzureBlobProvider_Storage_DataRead, "Read: GrainType={0} Grainid={1} ETag={2} from BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
@@ -224,7 +173,7 @@ namespace Orleans.Storage
             {
                 if (this.Log.IsVerbose3) this.Log.Verbose3((int)AzureProviderErrorCode.AzureBlobProvider_Storage_Writing, "Writing: GrainType={0} Grainid={1} ETag={2} to BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
 
-                var json = JsonConvert.SerializeObject(grainState.State, settings);
+                var json = JsonConvert.SerializeObject(grainState.State, jsonSettings);
 
                 var blob = container.GetBlockBlobReference(blobName);
                 blob.Properties.ContentType = "application/json";

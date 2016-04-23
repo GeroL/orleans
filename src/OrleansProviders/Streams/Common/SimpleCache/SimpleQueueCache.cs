@@ -26,9 +26,10 @@ namespace Orleans.Providers.Streams.Common
         }
     }
 
-    internal struct SimpleQueueCacheItem
+    internal class SimpleQueueCacheItem
     {
         internal IBatchContainer Batch;
+        internal bool DeliveryFailure;
         internal StreamSequenceToken SequenceToken;
         internal CacheBucket CacheBucket;
     }
@@ -48,9 +49,9 @@ namespace Orleans.Providers.Streams.Common
             get { return cachedMessages.Count; }
         }
 
-        public int MaxAddCount
+        public int GetMaxAddCount()
         {
-            get { return CACHE_HISTOGRAM_MAX_BUCKET_SIZE; }
+            return CACHE_HISTOGRAM_MAX_BUCKET_SIZE;
         }
 
         public SimpleQueueCache(int cacheSize, Logger logger)
@@ -102,7 +103,10 @@ namespace Orleans.Providers.Streams.Common
                 SimpleQueueCacheItem item = cachedMessages.Last.Value;
                 if (item.CacheBucket.Equals(bucket))
                 {
-                    itemsToRelease.Add(item.Batch);
+                    if (!item.DeliveryFailure)
+                    {
+                        itemsToRelease.Add(item.Batch);
+                    }
                     bucket.UpdateNumItems(-1);
                     cachedMessages.RemoveLast();
                 }
@@ -127,7 +131,7 @@ namespace Orleans.Providers.Streams.Common
             }
         }
 
-        public virtual IQueueCacheCursor GetCacheCursor(Guid streamGuid, string streamNamespace, StreamSequenceToken token)
+        public virtual IQueueCacheCursor GetCacheCursor(IStreamIdentity streamIdentity, StreamSequenceToken token)
         {
             if (token != null && !(token is EventSequenceToken))
             {
@@ -135,7 +139,7 @@ namespace Orleans.Providers.Streams.Common
                 throw new ArgumentOutOfRangeException("token", "token must be of type EventSequenceToken");
             }
 
-            var cursor = new SimpleQueueCacheCursor(this, streamGuid, streamNamespace, logger);
+            var cursor = new SimpleQueueCacheCursor(this, streamIdentity, logger);
             InitializeCursor(cursor, token, true);
             return cursor;
         }

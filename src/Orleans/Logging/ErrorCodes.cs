@@ -938,6 +938,8 @@ namespace Orleans
         RS_RangeChanged                         = ReminderServiceBase + 34,
         RS_LocalStop                            = ReminderServiceBase + 35,
         RS_Started                              = ReminderServiceBase + 36,
+        RS_ServiceInitialLoadFailing            = ReminderServiceBase + 37,
+        RS_ServiceInitialLoadFailed             = ReminderServiceBase + 38,
 
         
         // Codes for the Consistent Ring Provider
@@ -1022,6 +1024,7 @@ namespace Orleans
         Stream_ProducerIsDead                       = StreamProviderManagerBase + 6,
         StreamProvider_NoStreamForBatch             = StreamProviderManagerBase + 7,
         StreamProvider_ConsumerFailedToUnregister   = StreamProviderManagerBase + 8,
+        Stream_ConsumerIsDead                       = StreamProviderManagerBase + 9,
 
         PersistentStreamPullingManagerBase = Runtime + 3500,
         PersistentStreamPullingManager_01 = PersistentStreamPullingManagerBase + 1,
